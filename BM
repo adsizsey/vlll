@@ -1,0 +1,417 @@
+# =============================================================================
+# BENCHMARK ANALYSIS (Your Dataset as Gold Standard)
+#
+# - Uses YOUR dataset with machine facet scores + human facet scores
+# - Recomputes Human Pass as weighted avg of human facets:
+#       0.4 * Human Rel + 0.3 * Human Comp + 0.2 * Human Cons + 0.1 * Human Obj
+# - Runs multiple judge models via internal LLM gateway on query_*.txt
+# - Compares each model to your human labels (pass/fail + facet correlations)
+# =============================================================================
+
+import os
+import json
+import uuid
+import getpass
+import requests
+import urllib3
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    precision_recall_fscore_support,
+    cohen_kappa_score,
+)
+
+import gs_auth  # your internal auth helper
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ----------------------------- CONFIG ----------------------------------------
+
+USER_PATH = "my_results.xlsx"        # Your rich dataset
+
+# Folder with query_1.txt, query_2.txt, ..., query_N.txt
+JUDGE_INPUT_FOLDER = "judge_inputs"
+N_QUERY_FILES = 49  # adjust if needed
+
+FACETS = ["relevance", "comprehensiveness", "consistency", "objectivity"]
+
+# Human pass: threshold on weighted score (0-1)
+HUMAN_PASS_THRESHOLD = 0.5
+
+# Machine pass: threshold on overall_score (0-1)
+MACHINE_PASS_THRESHOLD = 0.7
+
+# Same judge prompt for all models; fill in your actual text
+LLM_AS_A_JUDGE_PROMPT = """
+You are an evaluation model. Read the following content (question, documents,
+and grounded answer) and return ONLY JSON with this shape:
+
+{
+  "rate_answer_results": {
+    "relevance_score": <0-1>,
+    "comprehensiveness_score": <0-1>,
+    "consistency_score": <0-1>,
+    "objectivity_score": <0-1>,
+    "overall_reasoning": "<short explanation>",
+    "overall_score": <0-1>
+  }
+}
+
+Do not add any extra keys or any text before or after the JSON.
+""".strip()
+
+# Gateway model ids and pretty labels
+MODEL_SPECS = [
+    # ("gpt-4_1-judge-newprompt", "GPT-4.1 Prompt v2"),
+    # ("gemini-1.5-flash-002-text", "Gemini 1.5 Flash"),
+    # ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+]
+
+# =============================================================================
+# Gateway & Utility Functions
+# =============================================================================
+
+
+
+
+def extract_text_from_gateway_response(resp: dict) -> str:
+    """
+    Extracts model-generated text from gateway response.
+    Adjust once to match the real schema.
+    """
+    if not isinstance(resp, dict):
+        return str(resp)
+
+    if "output" in resp and isinstance(resp["output"], str):
+        return resp["output"]
+
+    if "generated_text" in resp:
+        return resp["generated_text"]
+
+    if "data" in resp:
+        d = resp["data"]
+        if isinstance(d, dict):
+            for k in ("output", "generated_text", "text"):
+                if k in d and isinstance(d[k], str):
+                    return d[k]
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            for k in ("output", "generated_text", "text"):
+                if k in d[0] and isinstance(d[0][k], str):
+                    return d[0][k]
+
+    if "choices" in resp and resp["choices"]:
+        ch = resp["choices"][0]
+        if isinstance(ch, dict):
+            if "text" in ch:
+                return ch["text"]
+            if "message" in ch and isinstance(ch["message"], dict):
+                return ch["message"].get("content", "")
+
+    return json.dumps(resp)
+
+
+def parse_rate_answer_blob(raw):
+    """
+    Parse a JSON string of the form:
+    {
+      "rate_answer_results": {
+        "relevance_score": ...,
+        "comprehensiveness_score": ...,
+        "consistency_score": ...,
+        "objectivity_score": ...,
+        "overall_reasoning": "...",
+        "overall_score": ...
+      }
+    }
+    Returns the inner dict.
+    """
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return {}
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        s = str(raw).strip()
+        try:
+            data = json.loads(s)
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(s.replace("'", '"'))
+            except Exception:
+                return {}
+
+    if isinstance(data, dict) and "rate_answer_results" in data:
+        data = data["rate_answer_results"]
+
+    return data if isinstance(data, dict) else {}
+
+
+def scores_to_pass(overall_score, thr=MACHINE_PASS_THRESHOLD):
+    if pd.isna(overall_score):
+        return np.nan
+    return int(overall_score >= thr)
+
+
+def summarize_binary(y_true, y_pred, label="") -> dict:
+    """
+    Prints and returns standard binary classification metrics.
+    """
+    y_true = pd.Series(y_true)
+    y_pred = pd.Series(y_pred)
+    mask = y_true.notna() & y_pred.notna()
+    y_t = y_true[mask].astype(int)
+    y_p = y_pred[mask].astype(int)
+
+    print(f"\n===== {label} =====")
+    if len(y_t) < 2:
+        print("Not enough data for metrics.")
+        return {"n": len(y_t)}
+
+    cm = confusion_matrix(y_t, y_p)
+    tn, fp, fn, tp = cm.ravel()
+    acc = accuracy_score(y_t, y_p)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_t, y_p, average="binary", pos_label=1
+    )
+    kappa = cohen_kappa_score(y_t, y_p)
+
+    print("Confusion Matrix (rows = Human, cols = Model):")
+    print(cm)
+    print(f"TN (0->0)              : {tn}")
+    print(f"FP (0->1, lenient)     : {fp}")
+    print(f"FN (1->0, strict)      : {fn}")
+    print(f"TP (1->1)              : {tp}")
+    print(f"Accuracy               : {acc:.3f}")
+    print(f"Precision (Pass=1)     : {prec:.3f}")
+    print(f"Recall (Pass=1)        : {rec:.3f}")
+    print(f"F1 (Pass=1)            : {f1:.3f}")
+    print(f"Cohen's kappa          : {kappa:.3f}")
+
+    return {
+        "n": len(y_t),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "kappa": kappa,
+    }
+
+
+def load_query_files(folder: str, n_files: int):
+    """
+    Load query_1.txt ... query_n.txt into a list in order.
+    Stops early if a file is missing in the sequence.
+    """
+    texts = []
+    for i in range(1, n_files + 1):
+        path = os.path.join(folder, f"query_{i}.txt")
+        if not os.path.exists(path):
+            break
+        with open(path, "r", encoding="utf-8") as f:
+            texts.append(f.read())
+    return texts
+
+# =============================================================================
+# Load YOUR dataset & compute human_pass (weighted)
+# =============================================================================
+
+df_user = pd.read_excel(USER_PATH)
+
+# Standardize human facet column names (based on your description)
+df_user = df_user.rename(columns={
+    "Human Eval": "human_eval_comment",
+    "Human Rel": "human_relevance",
+    "Human Comp": "human_comprehensiveness",
+    "Human Cons": "human_consistency",
+    "Human Obj": "human_objectivity",
+    # ignore any original "Human Pass"
+})
+
+human_facet_cols = [
+    "human_relevance",
+    "human_comprehensiveness",
+    "human_consistency",
+    "human_objectivity",
+]
+
+# Ensure numeric
+for col in human_facet_cols:
+    if col in df_user.columns:
+        df_user[col] = pd.to_numeric(df_user[col], errors="coerce")
+
+# Compute weighted human pass score
+weights = np.array([0.4, 0.3, 0.2, 0.1])
+hf = df_user[human_facet_cols].values.astype(float)
+human_weighted = np.nansum(hf * weights, axis=1)
+df_user["human_pass_score"] = human_weighted
+df_user["human_pass"] = (df_user["human_pass_score"] >= HUMAN_PASS_THRESHOLD).astype(int)
+
+print("\nHuman weighted pass score stats:")
+print(df_user["human_pass_score"].describe())
+print("\nHuman pass (0/1) counts:")
+print(df_user["human_pass"].value_counts())
+
+# Slice human labels & facets to align to query files by index
+human_slice = df_user[human_facet_cols + ["human_pass"]].reset_index(drop=True)
+
+# =============================================================================
+# Run Benchmark: multiple judge models on query_*.txt
+# =============================================================================
+
+def run_judge_on_files(model_id: str,
+                       model_label: str,
+                       base_prompt: str,
+                       folder: str,
+                       n_files: int,
+                       human_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each query_i.txt, send base_prompt + text to model_id,
+    parse JSON, extract facet scores + overall_score, derive llm_pass,
+    and align with human_df (by row index).
+    """
+    texts = load_query_files(folder, n_files)
+    rows = []
+
+    for idx, txt in enumerate(texts):
+        full_prompt = f"{base_prompt}\n\n{txt}"
+        resp = call_llm_text_to_text(model_id, full_prompt)
+        out_text = extract_text_from_gateway_response(resp)
+        parsed = parse_rate_answer_blob(out_text)
+
+        row = {
+            "row_id": idx,
+            "model_name": model_label,
+        }
+        # facet scores
+        for f in FACETS:
+            key = f"{f}_score"
+            row[f"{f}_llm"] = parsed.get(key, np.nan)
+        # overall
+        overall = parsed.get("overall_score", np.nan)
+        row["overall_score_llm"] = overall
+        row["llm_pass"] = scores_to_pass(overall, thr=MACHINE_PASS_THRESHOLD)
+
+        rows.append(row)
+
+    df_model = pd.DataFrame(rows)
+
+    # Align with human_df by index
+    h = human_df.copy().reset_index(drop=True)
+    h["row_id"] = np.arange(len(h))
+    merged = pd.merge(df_model, h, on="row_id", how="left")
+
+    return merged
+
+
+def summarize_model(df_mm: pd.DataFrame, model_label: str) -> dict:
+    """
+    Compute performance metrics and facet correlations for one model.
+    """
+    metrics = summarize_binary(
+        df_mm["human_pass"],
+        df_mm["llm_pass"],
+        label=f"Benchmark – {model_label} (Machine vs Human Pass)"
+    )
+
+    # Facet correlations
+    for f in FACETS:
+        mcol = f"{f}_llm"
+        hcol = f"human_{f}"
+        if mcol in df_mm.columns and hcol in df_mm.columns:
+            sub = df_mm[[mcol, hcol]].dropna()
+            if len(sub) > 1:
+                r = sub[mcol].corr(sub[hcol])
+                metrics[f"{f}_corr"] = r
+                print(f"  Corr[{f.capitalize()}] = {r:.3f} (n={len(sub)})")
+            else:
+                print(f"  Corr[{f.capitalize()}] = n/a (not enough data)")
+        else:
+            print(f"  Corr[{f.capitalize()}] = n/a (missing cols)")
+    return metrics
+
+
+df_multi_list = []
+metrics_list = []
+
+if MODEL_SPECS:
+    print("\n\n========== RUNNING BENCHMARK MODELS ==========\n")
+    for model_id, model_label in MODEL_SPECS:
+        df_model = run_judge_on_files(
+            model_id=model_id,
+            model_label=model_label,
+            base_prompt=LLM_AS_A_JUDGE_PROMPT,
+            folder=JUDGE_INPUT_FOLDER,
+            n_files=N_QUERY_FILES,
+            human_df=human_slice,
+        )
+        df_multi_list.append(df_model)
+
+        print(f"\n--- Results for {model_label} ---")
+        metrics = summarize_model(df_model, model_label)
+        metrics["model_name"] = model_label
+        metrics_list.append(metrics)
+
+    # Aggregate summary table
+    model_summary = pd.DataFrame(metrics_list).set_index("model_name")
+    # Round floats for nice display
+    numeric_cols = model_summary.select_dtypes(include=[float]).columns
+    model_summary[numeric_cols] = model_summary[numeric_cols].round(3)
+
+    print("\n\n========== MODEL SUMMARY TABLE ==========")
+    print(model_summary)
+
+    # Concatenate all model rows if you want per-row analysis later
+    df_multi = pd.concat(df_multi_list, ignore_index=True)
+
+    # Example: show a few disagreements per model
+    print("\n\n========== EXAMPLE DISAGREEMENTS PER MODEL ==========")
+    for model_label in model_summary.index:
+        sub = df_multi[df_multi["model_name"] == model_label].copy()
+        sub["error_type"] = np.where(
+            (sub["human_pass"] == 1) & (sub["llm_pass"] == 1),
+            "Agree: Pass/Pass",
+            np.where(
+                (sub["human_pass"] == 0) & (sub["llm_pass"] == 0),
+                "Agree: Fail/Fail",
+                np.where(
+                    (sub["human_pass"] == 0) & (sub["llm_pass"] == 1),
+                    "Error: False Positive",
+                    np.where(
+                        (sub["human_pass"] == 1) & (sub["llm_pass"] == 0),
+                        "Error: False Negative",
+                        "Other/Invalid",
+                    ),
+                ),
+            ),
+        )
+        disagreements = sub[sub["error_type"].str.startswith("Error")].head(5)
+        print(f"\n[{model_label}] example disagreements:")
+        print(disagreements[[
+            "row_id",
+            "llm_pass",
+            "human_pass",
+            "relevance_llm",
+            "human_relevance",
+            "comprehensiveness_llm",
+            "human_comprehensiveness",
+            "consistency_llm",
+            "human_consistency",
+            "objectivity_llm",
+            "human_objectivity",
+            "overall_score_llm",
+            "error_type",
+        ]].to_string(index=False))
+else:
+    print("\n[Info] MODEL_SPECS is empty; no benchmark models to run.")
+
+# =============================================================================
+# END
+# - model_summary: comparison table for all judge models
+# - df_multi: per-row results (facets & pass/fail vs your human labels)
+# - You can drop model_summary straight into the report as the benchmark table.
+# =============================================================================
