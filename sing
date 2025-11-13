@@ -1,0 +1,21 @@
+with open(FILE_PATH, "r", encoding="utf-8") as f:
+    text = f.read()
+
+# 2. Construct final prompt
+full_prompt = f"{LLM_AS_A_JUDGE_PROMPT}\n\n{text}"
+
+print("\nSending prompt to LLM...\n")
+
+# 3. Call LLM
+resp = call_llm_text_to_text(MODEL_ID, full_prompt)
+
+# 4. Extract text output
+out_text = extract_text_from_gateway_response(resp)
+print("\nRaw model output:")
+print(out_text)
+
+# 5. Parse JSON for scores
+parsed = parse_rate_answer(out_text)
+
+print("\nParsed scores:")
+print(json.dumps(parsed, indent=2))
