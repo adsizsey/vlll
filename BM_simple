@@ -1,0 +1,191 @@
+import os
+import json
+import uuid
+import getpass
+import requests
+import urllib3
+import pandas as pd
+import numpy as np
+import gs_auth  # your internal auth helper
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# =========================
+# CONFIG – EDIT THESE
+# =========================
+
+DATA_PATH   = "my_results.xlsx"      # your labeled dataset
+OUTPUT_PATH = "my_results_with_alt_judge.xlsx"
+
+QUERY_FOLDER = "judge_inputs"        # folder with query_1.txt, query_2.txt, ...
+
+ALT_MODEL_ID = "gpt-4_1-judge-newprompt"  # <-- ID of the *new* judge model (model B)
+
+# The exact prompt you already use for the existing judge:
+LLM_AS_A_JUDGE_PROMPT = """
+PASTE YOUR EXISTING JUDGE PROMPT HERE EXACTLY
+(e.g. the one that returns rate_answer_results with 4 scores and overall_score)
+""".strip()
+
+# Suffix for new model’s scores
+ALT_SUFFIX = "_alt"   # e.g. relevance_score_alt
+
+
+# =========================
+# Gateway helpers
+# =========================
+
+def call_llm_text_to_text(model_id: str, prompt: str) -> dict:
+    """Single call to internal GS LLM gateway."""
+    url = f"https://uat.gpt.site.gs.com/llm-gateway/api/service/external/{model_id}/infer"
+
+    user = getpass.getuser()
+    gssso = gs_auth.get_gssso()
+
+    headers = {
+        "cookie": f"GSSSO={gssso}",
+        "X-API-KEY": gssso,
+        "app_id": "mrm-test",
+        "conversation_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "kerberos": user,
+    }
+
+    r = requests.post(url, json={"text": prompt}, headers=headers, verify=False)
+    print(f"[{model_id}] HTTP {r.status_code}")
+    return r.json()
+
+
+def extract_text_from_gateway_response(resp: dict) -> str:
+    """Pull raw text out of gateway response (handles common shapes)."""
+    if not isinstance(resp, dict):
+        return str(resp)
+
+    if "output" in resp and isinstance(resp["output"], str):
+        return resp["output"]
+
+    if "generated_text" in resp:
+        return resp["generated_text"]
+
+    if "data" in resp:
+        d = resp["data"]
+        if isinstance(d, dict):
+            for k in ("output", "generated_text", "text"):
+                if k in d and isinstance(d[k], str):
+                    return d[k]
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            for k in ("output", "generated_text", "text"):
+                if k in d[0] and isinstance(d[0][k], str):
+                    return d[0][k]
+
+    if "choices" in resp and resp["choices"]:
+        ch = resp["choices"][0]
+        if "text" in ch:
+            return ch["text"]
+        if "message" in ch and isinstance(ch["message"], dict):
+            return ch["message"].get("content", "")
+
+    return json.dumps(resp)
+
+
+def parse_rate_answer_json(text: str) -> dict:
+    """
+    Parse the JSON returned by the judge into a dict with keys like:
+      relevance_score, comprehensiveness_score, consistency_score, objectivity_score, overall_score
+    """
+    try:
+        obj = json.loads(text)
+    except Exception:
+        print("!! JSON parse error, raw text:")
+        print(text[:500])
+        return {}
+
+    if isinstance(obj, dict) and "rate_answer_results" in obj:
+        return obj["rate_answer_results"]
+    return obj if isinstance(obj, dict) else {}
+
+
+# =========================
+# MAIN EXPERIMENT
+# =========================
+
+# 1. Load your labeled data
+df = pd.read_excel(DATA_PATH)
+
+# Expect these columns to exist: "query", "grounded_answer"
+if "query" not in df.columns or "grounded_answer" not in df.columns:
+    raise ValueError("Data must contain 'query' and 'grounded_answer' columns.")
+
+# 2. Prepare lists to collect new model's scores
+relevance_alt         = []
+comprehensiveness_alt = []
+consistency_alt       = []
+objectivity_alt       = []
+overall_alt           = []
+
+# 3. Loop over rows and files
+for idx, row in df.iterrows():
+    file_idx = idx + 1  # row 0 → query_1.txt, etc.
+    file_path = os.path.join(QUERY_FOLDER, f"query_{file_idx}.txt")
+
+    if not os.path.exists(file_path):
+        print(f"[WARN] Missing file {file_path}, filling NaNs for this row.")
+        relevance_alt.append(np.nan)
+        comprehensiveness_alt.append(np.nan)
+        consistency_alt.append(np.nan)
+        objectivity_alt.append(np.nan)
+        overall_alt.append(np.nan)
+        continue
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        source_text = f.read()
+
+    uq = str(row["query"])
+    ga = str(row["grounded_answer"])
+
+    # Build the exact structure you described:
+    # [INPUTS]
+    # [USER_QUERY]
+    # {uq}
+    # [GROUNDED_ANSWER]
+    # {ga}
+    # ... then the file contents
+    full_prompt = f"""{LLM_AS_A_JUDGE_PROMPT}
+
+[INPUTS]
+[USER_QUERY]
+{uq}
+[GROUNDED_ANSWER]
+{ga}
+
+{source_text}
+"""
+
+    print(f"\n--- Row {idx} (query_{file_idx}.txt) ---")
+    resp = call_llm_text_to_text(ALT_MODEL_ID, full_prompt)
+    out_text = extract_text_from_gateway_response(resp)
+    result = parse_rate_answer_json(out_text)
+
+    # Extract scores safely
+    relevance_alt.append(result.get("relevance_score", np.nan))
+    comprehensiveness_alt.append(result.get("comprehensiveness_score", np.nan))
+    consistency_alt.append(result.get("consistency_score", np.nan))
+    objectivity_alt.append(result.get("objectivity_score", np.nan))
+    overall_alt.append(result.get("overall_score", np.nan))
+
+# 4. Write new model’s scores as extra columns
+df[f"relevance_score{ALT_SUFFIX}"]         = relevance_alt
+df[f"comprehensiveness_score{ALT_SUFFIX}"] = comprehensiveness_alt
+df[f"consistency_score{ALT_SUFFIX}"]       = consistency_alt
+df[f"objectivity_score{ALT_SUFFIX}"]       = objectivity_alt
+df[f"overall_score{ALT_SUFFIX}"]           = overall_alt
+
+# 5. Save out for comparison & analysis
+df.to_excel(OUTPUT_PATH, index=False)
+print(f"\nDone. Saved with alt judge scores to: {OUTPUT_PATH}")
+
+# Now df has:
+# - original judge scores: relevance_score, ..., overall_score
+# - new model scores:      relevance_score_alt, ..., overall_score_alt
+#
+# You can directly compare them row-wise or with correlations, plots, etc.
