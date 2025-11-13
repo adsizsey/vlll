@@ -1,0 +1,585 @@
+# =============================================================================
+# FULL ANALYSIS & PRESENTATION FOR:
+#   A) THEIR DATASET (VENDOR) – machine JSON + single human Pass/Fail
+#   B) YOUR DATASET – machine facet scores + human facet scores
+#
+# Assumption for YOUR DATA:
+#   Human Pass = weighted average of:
+#       0.4 * Human Rel
+#       0.3 * Human Comp
+#       0.2 * Human Cons
+#       0.1 * Human Obj
+#   Then thresholded to {0,1} and original "Human Pass" column ignored.
+# =============================================================================
+
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    precision_recall_fscore_support,
+    cohen_kappa_score,
+)
+from sklearn.linear_model import LogisticRegression
+
+plt.tight_layout()
+
+# ----------------------------- CONFIG ----------------------------------------
+
+VENDOR_PATH = "their_results.xlsx"   # THEIR dataset
+USER_PATH   = "my_results.xlsx"      # YOUR dataset
+
+FACETS = ["relevance", "comprehensiveness", "consistency", "objectivity"]
+
+# Thresholds
+HUMAN_PASS_THRESHOLD    = 0.5  # threshold on weighted human score to mark pass (0/1)
+MACHINE_PASS_THRESHOLD  = 0.7  # for machine overall_score if needed
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def to_binary(x):
+    """Convert pass/fail-like values to 0/1; returns np.nan if not interpretable."""
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ["pass", "passed", "ok", "yes", "y", "1"]:
+            return 1
+        if s in ["fail", "failed", "no", "n", "0"]:
+            return 0
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, (int, float)) and not np.isnan(x):
+        return 1 if x >= 0.5 else 0
+    return np.nan
+
+def parse_rate_answer_blob(raw):
+    """
+    Parse vendor JSON blob in `rate_answer` column:
+    {
+      "rate_answer_results": {
+        "relevance_score": ...,
+        "comprehensiveness_score": ...,
+        "consistency_score": ...,
+        "objectivity_score": ...,
+        "overall_reasoning": "...",
+        "overall_score": ...
+      }
+    }
+    Returns the inner dict.
+    """
+    if pd.isna(raw):
+        return {}
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        s = str(raw).strip()
+        try:
+            data = json.loads(s)
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(s.replace("'", '"'))
+            except Exception:
+                return {}
+    if isinstance(data, dict) and "rate_answer_results" in data:
+        data = data["rate_answer_results"]
+    return data if isinstance(data, dict) else {}
+
+def summarize_binary(y_true, y_pred, label=""):
+    """Print confusion matrix and standard classification stats."""
+    y_true = pd.Series(y_true)
+    y_pred = pd.Series(y_pred)
+    mask = y_true.notna() & y_pred.notna()
+    y_t = y_true[mask].astype(int)
+    y_p = y_pred[mask].astype(int)
+
+    print(f"\n================ {label} ================")
+    if len(y_t) < 2:
+        print("Not enough data for metrics.")
+        return None
+
+    cm = confusion_matrix(y_t, y_p)
+    tn, fp, fn, tp = cm.ravel()
+    acc = accuracy_score(y_t, y_p)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_t, y_p, average="binary", pos_label=1
+    )
+    kappa = cohen_kappa_score(y_t, y_p)
+
+    print("Confusion Matrix (rows=True/Human, cols=Pred/Machine):")
+    print(cm)
+    print(f"TN (0->0): {tn}")
+    print(f"FP (0->1): {fp}  [False Positives: too lenient]")
+    print(f"FN (1->0): {fn}  [False Negatives: too strict]")
+    print(f"TP (1->1): {tp}")
+    print(f"Accuracy       : {acc:.3f}")
+    print(f"Precision (1)  : {prec:.3f}")
+    print(f"Recall (1)     : {rec:.3f}")
+    print(f"F1 (1)         : {f1:.3f}")
+    print(f"Cohen's kappa  : {kappa:.3f}")
+
+    return {
+        "n": len(y_t),
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "kappa": kappa,
+    }
+
+def plot_facet_boxplots_by_human(df, facet_cols, human_col, title_prefix):
+    """
+    For each facet, plot boxplots of machine facet scores conditioned on human pass/fail.
+    facet_cols is list of machine facet column names.
+    human_col is 0/1 human label.
+    """
+    for col in facet_cols:
+        if col not in df.columns:
+            continue
+        data_pass = df.loc[df[human_col] == 1, col].dropna()
+        data_fail = df.loc[df[human_col] == 0, col].dropna()
+        if len(data_pass) == 0 and len(data_fail) == 0:
+            continue
+
+        plt.figure()
+        plt.boxplot(
+            [data_fail, data_pass],
+            labels=["Human Fail", "Human Pass"],
+            showmeans=True,
+        )
+        plt.title(f"{title_prefix} – {col}")
+        plt.ylabel(col)
+        plt.grid(True)
+        # plt.show()
+
+def radar_plot_two(means_a, means_b, labels, label_a, label_b, title):
+    """
+    Simple radar chart comparing two sets of facet means.
+    """
+    if len(means_a) != len(means_b) or len(means_a) != len(labels):
+        print("Radar plot: mismatched lengths; skipping.")
+        return
+
+    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False)
+    angles = np.concatenate([angles, [angles[0]]])
+    vals_a = list(means_a) + [means_a[0]]
+    vals_b = list(means_b) + [means_b[0]]
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, polar=True)
+    ax.plot(angles, vals_a, marker="o", label=label_a)
+    ax.fill(angles, vals_a, alpha=0.1)
+    ax.plot(angles, vals_b, marker="o", label=label_b)
+    ax.fill(angles, vals_b, alpha=0.1)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels)
+    ax.set_title(title)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
+    # plt.show()
+
+# =============================================================================
+# A) THEIR DATASET (VENDOR)
+# =============================================================================
+
+print("\n\n############################################################")
+print("# A) THEIR DATASET (VENDOR)")
+print("############################################################")
+
+df_vendor = pd.read_excel(VENDOR_PATH)
+
+# Try to detect LLM and Human eval columns by prefix to be robust
+llm_eval_col = next((c for c in df_vendor.columns if c.startswith("LLM Eval")), None)
+human_eval_col = next((c for c in df_vendor.columns if c.startswith("Human Eval")), None)
+expl_col = "Explanation" if "Explanation" in df_vendor.columns else None
+
+# 1) Vendor human overall pass/fail
+if human_eval_col is not None:
+    df_vendor["human_pass_vendor"] = df_vendor[human_eval_col].apply(to_binary)
+else:
+    df_vendor["human_pass_vendor"] = np.nan
+
+# 2) Machine facets from JSON in rate_answer, plus machine pass
+if "rate_answer" in df_vendor.columns:
+    parsed_vendor = df_vendor["rate_answer"].apply(parse_rate_answer_blob)
+    for f in FACETS:
+        df_vendor[f"{f}_score_vendor"] = parsed_vendor.apply(
+            lambda d, ff=f: d.get(f"{ff}_score", np.nan)
+        )
+    df_vendor["overall_score_vendor"] = parsed_vendor.apply(
+        lambda d: d.get("overall_score", np.nan)
+    )
+else:
+    for f in FACETS:
+        df_vendor[f"{f}_score_vendor"] = np.nan
+    df_vendor["overall_score_vendor"] = np.nan
+
+# If there's a discrete machine eval column, use that for pass/fail; else derive from overall_score
+if llm_eval_col is not None:
+    df_vendor["llm_pass_vendor"] = df_vendor[llm_eval_col].apply(to_binary)
+else:
+    df_vendor["llm_pass_vendor"] = df_vendor["overall_score_vendor"].apply(
+        lambda x: 1 if x >= MACHINE_PASS_THRESHOLD else 0
+    )
+
+# ---- A1: Overall metrics (machine vs vendor human)
+vendor_metrics = summarize_binary(
+    df_vendor["human_pass_vendor"],
+    df_vendor["llm_pass_vendor"],
+    label="Vendor: Machine vs Vendor Human (Overall Pass/Fail)"
+)
+
+# ---- A2: Facet distributions by human outcome (boxplots)
+facet_cols_vendor = [f"{f}_score_vendor" for f in FACETS]
+plot_facet_boxplots_by_human(
+    df_vendor, facet_cols_vendor, "human_pass_vendor",
+    title_prefix="Vendor Machine Facets by Vendor Human Pass/Fail"
+)
+
+# ---- A3: Logistic regression – which machine facets matter for vendor human pass?
+# Only on rows with non-missing
+mask_vendor = df_vendor["human_pass_vendor"].notna()
+X_vendor = df_vendor.loc[mask_vendor, facet_cols_vendor].astype(float)
+y_vendor = df_vendor.loc[mask_vendor, "human_pass_vendor"].astype(int)
+
+if len(X_vendor) > 5 and X_vendor.notna().all(axis=1).sum() > 5:
+    mask_non_na = X_vendor.notna().all(axis=1)
+    Xv = X_vendor[mask_non_na]
+    yv = y_vendor[mask_non_na]
+    if len(Xv) > 5 and yv.nunique() > 1:
+        logreg_vendor = LogisticRegression()
+        logreg_vendor.fit(Xv, yv)
+        print("\nVendor logistic regression coefficients (predicting vendor human pass from machine facets):")
+        for coef, col in zip(logreg_vendor.coef_[0], facet_cols_vendor):
+            print(f"{col:>25}: {coef:.3f}")
+    else:
+        print("\n[Vendor logistic regression] Not enough variation or data; skipping.")
+else:
+    print("\n[Vendor logistic regression] Not enough data; skipping.")
+
+# ---- A4: Radar plot – machine facets for human pass vs human fail
+means_pass = [df_vendor.loc[df_vendor["human_pass_vendor"] == 1, col].mean()
+              for col in facet_cols_vendor]
+means_fail = [df_vendor.loc[df_vendor["human_pass_vendor"] == 0, col].mean()
+              for col in facet_cols_vendor]
+radar_plot_two(
+    means_pass,
+    means_fail,
+    [f.capitalize() for f in FACETS],
+    label_a="Human Pass rows",
+    label_b="Human Fail rows",
+    title="Vendor: Machine Facet Means by Vendor Human Label"
+)
+
+# ---- A5: Example table – a few disagreement rows
+df_vendor["error_type_vendor"] = np.where(
+    (df_vendor["human_pass_vendor"] == 1) & (df_vendor["llm_pass_vendor"] == 1),
+    "Agree: Pass/Pass",
+    np.where(
+        (df_vendor["human_pass_vendor"] == 0) & (df_vendor["llm_pass_vendor"] == 0),
+        "Agree: Fail/Fail",
+        np.where(
+            (df_vendor["human_pass_vendor"] == 0) & (df_vendor["llm_pass_vendor"] == 1),
+            "Error: False Positive",
+            np.where(
+                (df_vendor["human_pass_vendor"] == 1) & (df_vendor["llm_pass_vendor"] == 0),
+                "Error: False Negative",
+                "Other/Invalid"
+            )
+        )
+    )
+)
+
+print("\nVendor error type breakdown:")
+print(
+    df_vendor["error_type_vendor"]
+    .value_counts()
+    .to_frame("count")
+    .assign(percent=lambda d: (d["count"] / len(df_vendor) * 100).round(1))
+)
+
+vendor_disagreements = df_vendor[df_vendor["error_type_vendor"].str.startswith("Error")].copy()
+# Select a few columns for storytelling
+cols_for_vendor_examples = [
+    c for c in [
+        "query",
+        "grounded_answer",
+        llm_eval_col,
+        human_eval_col,
+        "human_explanation",
+        "overall_score_vendor",
+        *facet_cols_vendor,
+        "error_type_vendor",
+    ]
+    if c in df_vendor.columns
+]
+vendor_examples = vendor_disagreements[cols_for_vendor_examples].head(6)
+print("\n[Vendor] Example disagreement rows (for report table):")
+print(vendor_examples)
+
+# =============================================================================
+# B) YOUR DATASET (MORE GRANULAR: MACHINE FACETS + HUMAN FACETS)
+# =============================================================================
+
+print("\n\n############################################################")
+print("# B) YOUR DATASET (MACHINE FACETS + HUMAN FACETS)")
+print("############################################################")
+
+df_user = pd.read_excel(USER_PATH)
+
+# Expected machine columns on YOUR dataset:
+#   query, grounded_answer, relevance_score, comprehensiveness_score,
+#   consistency_score, objectivity_score, overall_reasoning, overall_score
+machine_facet_cols_user = [
+    "relevance_score",
+    "comprehensiveness_score",
+    "consistency_score",
+    "objectivity_score",
+]
+machine_overall_col_user = "overall_score"
+
+# Expected human facet columns (from screenshot):
+df_user = df_user.rename(columns={
+    "Human Eval": "human_eval_comment",
+    "Human Rel": "human_relevance",
+    "Human Comp": "human_comprehensiveness",
+    "Human Cons": "human_consistency",
+    "Human Obj": "human_objectivity",
+    # "Human Pass": original column will be ignored
+})
+
+human_facet_cols_user = [
+    "human_relevance",
+    "human_comprehensiveness",
+    "human_consistency",
+    "human_objectivity",
+]
+
+# Ensure numeric for human facets
+for col in human_facet_cols_user:
+    if col in df_user.columns:
+        df_user[col] = pd.to_numeric(df_user[col], errors="coerce")
+
+# ---- B1: Construct Human Pass as weighted average of facets
+# weights: 0.4 Rel, 0.3 Comp, 0.2 Cons, 0.1 Obj
+weights = np.array([0.4, 0.3, 0.2, 0.1])
+hf = df_user[human_facet_cols_user].values.astype(float)
+human_weighted = np.nansum(hf * weights, axis=1)  # sum of weighted facets
+df_user["human_pass_weighted_score"] = human_weighted
+df_user["human_pass"] = (df_user["human_pass_weighted_score"] >= HUMAN_PASS_THRESHOLD).astype(int)
+
+print("\nHuman pass (weighted) stats:")
+print(df_user["human_pass_weighted_score"].describe())
+print("\nHuman pass (0/1) value counts:")
+print(df_user["human_pass"].value_counts())
+
+# ---- B2: Machine pass (from overall_score) vs human pass
+if machine_overall_col_user in df_user.columns:
+    df_user["machine_pass_user"] = (df_user[machine_overall_col_user] >= MACHINE_PASS_THRESHOLD).astype(int)
+    user_metrics = summarize_binary(
+        df_user["human_pass"],
+        df_user["machine_pass_user"],
+        label="Your Data: Machine vs Human (Weighted Pass)"
+    )
+else:
+    print("\n[Your data] Missing overall_score column for machine; cannot compute machine_pass_user.")
+
+# ---- B3: Facet correlations: machine facet vs human facet
+print("\nFacet correlations (Your Data: machine facet vs human facet):")
+for f in FACETS:
+    mach_col = f"{f}_score" if f"{f}_score" in df_user.columns else f"{f}_score_user"
+    # But from your description, exact machine columns are e.g. 'relevance_score'
+    alt_mach_col = f"{f}_score"
+    if f == "relevance":
+        mach_col = "relevance_score"
+    elif f == "comprehensiveness":
+        mach_col = "comprehensiveness_score"
+    elif f == "consistency":
+        mach_col = "consistency_score"
+    elif f == "objectivity":
+        mach_col = "objectivity_score"
+
+    hum_col = f"human_{f}"
+    if mach_col in df_user.columns and hum_col in df_user.columns:
+        sub = df_user[[mach_col, hum_col]].dropna()
+        if len(sub) > 1:
+            r = sub[mach_col].corr(sub[hum_col])
+            print(f"{f.capitalize():>17}: r = {r:.3f} (n={len(sub)})")
+        else:
+            print(f"{f.capitalize():>17}: not enough data")
+    else:
+        print(f"{f.capitalize():>17}: missing columns ({mach_col}, {hum_col})")
+
+# ---- B4: Scatter / calibration plots per facet
+for f in FACETS:
+    if f == "relevance":
+        mach_col = "relevance_score"
+    elif f == "comprehensiveness":
+        mach_col = "comprehensiveness_score"
+    elif f == "consistency":
+        mach_col = "consistency_score"
+    else:
+        mach_col = "objectivity_score"
+    hum_col = f"human_{f}"
+    if mach_col not in df_user.columns or hum_col not in df_user.columns:
+        continue
+    sub = df_user[[mach_col, hum_col]].dropna()
+    if len(sub) < 2:
+        continue
+
+    plt.figure()
+    plt.scatter(sub[hum_col], sub[mach_col], alpha=0.7)
+    min_val = min(sub[hum_col].min(), sub[mach_col].min())
+    max_val = max(sub[hum_col].max(), sub[mach_col].max())
+    plt.plot([min_val, max_val], [min_val, max_val], linestyle="--")
+    plt.xlabel(f"Human {f.capitalize()}")
+    plt.ylabel(f"Machine {f.capitalize()}")
+    plt.title(f"Calibration: {f.capitalize()} (Human vs Machine)")
+    plt.grid(True)
+    # plt.show()
+
+# ---- B5: Error grid – facet distributions by (Human, Machine) pass/fail
+if "machine_pass_user" in df_user.columns:
+    df_user["error_type_user"] = np.where(
+        (df_user["human_pass"] == 1) & (df_user["machine_pass_user"] == 1),
+        "Agree: Pass/Pass",
+        np.where(
+            (df_user["human_pass"] == 0) & (df_user["machine_pass_user"] == 0),
+            "Agree: Fail/Fail",
+            np.where(
+                (df_user["human_pass"] == 0) & (df_user["machine_pass_user"] == 1),
+                "Error: False Positive",
+                np.where(
+                    (df_user["human_pass"] == 1) & (df_user["machine_pass_user"] == 0),
+                    "Error: False Negative",
+                    "Other/Invalid"
+                )
+            )
+        )
+    )
+
+    print("\nYour data – error type breakdown:")
+    print(
+        df_user["error_type_user"]
+        .value_counts()
+        .to_frame("count")
+        .assign(percent=lambda d: (d["count"] / len(df_user) * 100).round(1))
+    )
+
+    # For each facet, show boxplots across the 4 error types
+    for idx, f in enumerate(FACETS):
+        if f == "relevance":
+            mach_col = "relevance_score"
+        elif f == "comprehensiveness":
+            mach_col = "comprehensiveness_score"
+        elif f == "consistency":
+            mach_col = "consistency_score"
+        else:
+            mach_col = "objectivity_score"
+        if mach_col not in df_user.columns:
+            continue
+
+        plt.figure()
+        groups = ["Agree: Pass/Pass", "Agree: Fail/Fail", "Error: False Positive", "Error: False Negative"]
+        data = [
+            df_user.loc[df_user["error_type_user"] == g, mach_col].dropna()
+            for g in groups
+        ]
+        # Filter groups with no data to keep labels aligned
+        data_filtered = [d for d in data if len(d) > 0]
+        labels_filtered = [g for d, g in zip(data, groups) if len(d) > 0]
+
+        if not data_filtered:
+            continue
+
+        plt.boxplot(data_filtered, labels=labels_filtered, showmeans=True)
+        plt.title(f"Your Data – {f.capitalize()} Machine Score by Error Type")
+        plt.ylabel(mach_col)
+        plt.xticks(rotation=20)
+        plt.grid(True)
+        # plt.show()
+
+# ---- B6: Radar – machine vs human facet means (your dataset)
+machine_means_user = []
+human_means_user = []
+facet_labels = []
+for f in FACETS:
+    if f == "relevance":
+        mach_col = "relevance_score"
+    elif f == "comprehensiveness":
+        mach_col = "comprehensiveness_score"
+    elif f == "consistency":
+        mach_col = "consistency_score"
+    else:
+        mach_col = "objectivity_score"
+    hum_col = f"human_{f}"
+    if mach_col in df_user.columns and hum_col in df_user.columns:
+        machine_means_user.append(df_user[mach_col].mean())
+        human_means_user.append(df_user[hum_col].mean())
+        facet_labels.append(f.capitalize())
+
+if facet_labels:
+    radar_plot_two(
+        human_means_user,
+        machine_means_user,
+        facet_labels,
+        label_a="Human facet means",
+        label_b="Machine facet means",
+        title="Your Data – Human vs Machine Facet Means"
+    )
+
+# ---- B7: "Traffic-light" style table: numeric, stylable in a notebook
+# (In a Jupyter Notebook, you can do df_traffic.style.background_gradient(...))
+# Here we just assemble the table; styling is interactive.
+cols_for_heat = []
+for f in FACETS:
+    if f == "relevance":
+        mach_col = "relevance_score"
+    elif f == "comprehensiveness":
+        mach_col = "comprehensiveness_score"
+    elif f == "consistency":
+        mach_col = "consistency_score"
+    else:
+        mach_col = "objectivity_score"
+    hum_col = f"human_{f}"
+    if mach_col in df_user.columns and hum_col in df_user.columns:
+        cols_for_heat.extend([hum_col, mach_col])
+
+cols_for_heat.extend(["human_pass", "machine_pass_user"] if "machine_pass_user" in df_user.columns else ["human_pass"])
+
+df_traffic = df_user[cols_for_heat].copy().head(20)  # first 20 rows for quick view
+print("\n[Your data] Sample 'traffic-light' table (first 20 rows, numeric only):")
+print(df_traffic)
+
+# In a notebook, you could do:
+# df_traffic.style.background_gradient(axis=None, cmap="RdYlGn")
+
+# ---- B8: Representative examples (Pass/Pass, FP, FN)
+if "error_type_user" in df_user.columns:
+    example_cols = ["query", "grounded_answer",
+                    "human_eval_comment",
+                    "human_relevance", "human_comprehensiveness",
+                    "human_consistency", "human_objectivity",
+                    "human_pass_weighted_score", "human_pass"]
+    # Also machine columns:
+    example_cols += machine_facet_cols_user + [machine_overall_col_user]
+    example_cols = [c for c in example_cols if c in df_user.columns]
+
+    print("\n[Your data] Example Pass/Pass rows:")
+    print(df_user[df_user["error_type_user"] == "Agree: Pass/Pass"][example_cols].head(2))
+
+    print("\n[Your data] Example False Positive rows (Machine Pass, Human Fail):")
+    print(df_user[df_user["error_type_user"] == "Error: False Positive"][example_cols].head(2))
+
+    print("\n[Your data] Example False Negative rows (Machine Fail, Human Pass):")
+    print(df_user[df_user["error_type_user"] == "Error: False Negative"][example_cols].head(2))
+
+# =============================================================================
+# END – You now have:
+#   - Vendor-level metrics + facets + examples
+#   - Your data metrics + facet correlations + calibration, error grids, radar,
+#     "traffic-light" table and representative examples
+#   All ready to be plugged into figures/tables in your validation report.
+# =============================================================================
