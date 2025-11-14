@@ -1,305 +1,110 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
+import pandas as pd
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    cohen_kappa_score,
+    precision_score,
+    recall_score,
+    fbeta_score,
+)
 
-# Make plots a bit bigger by default
-plt.rcParams["figure.figsize"] = (6, 4)
+# ============================================================
+# Load developer dataset
+# ============================================================
+PATH_VENDOR = "./Marque_ai/mq_ai_lite_results.csv"
+df_v = pd.read_csv(PATH_VENDOR)
 
+# ============================================================
+# Helper: normalize Pass/Fail columns to 0/1
+# ============================================================
 
-# =============================================================================
-# Generic helpers
-# =============================================================================
-
-def plot_confusion_matrix_from_labels(y_true, y_pred, title, labels=("Fail", "Pass")):
-    """Draw a confusion matrix heatmap using matplotlib only."""
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-
-    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_t = y_true[mask].astype(int)
-    y_p = y_pred[mask].astype(int)
-    if len(y_t) == 0:
-        print(f"[{title}] Not enough data to plot confusion matrix.")
-        return
-
-    cm = confusion_matrix(y_t, y_p, labels=[0, 1])
-
-    fig, ax = plt.subplots()
-    im = ax.imshow(cm, interpolation="nearest")
-    ax.set_title(title)
-    fig.colorbar(im, ax=ax)
-
-    # Tick labels
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(labels)
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("Model prediction")
-    ax.set_ylabel("Human label")
-
-    # Annotate cells
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, cm[i, j], ha="center", va="center", color="w")
-
-    plt.tight_layout()
-    # plt.show()
-
-
-def plot_bar(values, labels, title, ylabel=None):
-    """Simple vertical bar plot."""
-    x = np.arange(len(values))
-    fig, ax = plt.subplots()
-    ax.bar(x, values)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20)
-    ax.set_title(title)
-    if ylabel:
-        ax.set_ylabel(ylabel)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    # plt.show()
-
-
-def plot_grouped_bar(groups, values_a, values_b, label_a, label_b, title, ylabel=None):
-    """Side-by-side bar chart for two series over same groups."""
-    x = np.arange(len(groups))
-    width = 0.35
-
-    fig, ax = plt.subplots()
-    ax.bar(x - width/2, values_a, width, label=label_a)
-    ax.bar(x + width/2, values_b, width, label=label_b)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(groups, rotation=20)
-    ax.set_title(title)
-    if ylabel:
-        ax.set_ylabel(ylabel)
-    ax.legend()
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    # plt.show()
-
-
-# =============================================================================
-# A) Vendor dataset plots
-# =============================================================================
-
-def plot_vendor_confusion_matrix(df_vendor):
-    plot_confusion_matrix_from_labels(
-        df_vendor["human_pass_vendor"].values,
-        df_vendor["llm_pass_vendor"].values,
-        title="Vendor – Machine vs Human (Pass/Fail)"
-    )
-
-def plot_vendor_error_bar(df_vendor):
-    """Bar chart of error types (Agree / FP / FN) for vendor data."""
-    if "error_type_vendor" not in df_vendor.columns:
-        print("[Vendor error bar] 'error_type_vendor' not found; run classification first.")
-        return
-
-    counts = df_vendor["error_type_vendor"].value_counts()
-    plot_bar(
-        counts.values,
-        counts.index.tolist(),
-        title="Vendor – Error Type Counts",
-        ylabel="Count"
-    )
-
-def plot_vendor_facet_means_by_human(df_vendor):
-    """Grouped bars: machine facet means for human-pass vs human-fail rows."""
-    facet_cols_vendor = [
-        c for c in df_vendor.columns
-        if c.endswith("_score_vendor") and any(f in c for f in ["relevance","comprehensiveness","consistency","objectivity"])
-    ]
-    if not facet_cols_vendor:
-        print("[Vendor facets] No *_score_vendor columns found.")
-        return
-
-    human_col = "human_pass_vendor"
-    groups = []
-    means_pass = []
-    means_fail = []
-
-    for col in facet_cols_vendor:
-        fp = df_vendor.loc[df_vendor[human_col] == 1, col].mean()
-        ff = df_vendor.loc[df_vendor[human_col] == 0, col].mean()
-        groups.append(col.replace("_score_vendor", "").replace("_", " ").title())
-        means_pass.append(fp)
-        means_fail.append(ff)
-
-    plot_grouped_bar(
-        groups,
-        means_pass,
-        means_fail,
-        label_a="Human Pass rows",
-        label_b="Human Fail rows",
-        title="Vendor – Machine Facet Means by Human Label",
-        ylabel="Facet score"
-    )
-
-
-# =============================================================================
-# B) Your dataset plots
-# =============================================================================
-
-def plot_user_confusion_matrix(df_user):
-    if "machine_pass_user" not in df_user.columns:
-        print("[User confusion] 'machine_pass_user' not found.")
-        return
-
-    plot_confusion_matrix_from_labels(
-        df_user["human_pass"].values,
-        df_user["machine_pass_user"].values,
-        title="Your Data – Machine vs Human (Weighted Pass/Fail)"
-    )
-
-def plot_user_error_bar(df_user):
-    if "error_type_user" not in df_user.columns:
-        print("[User error bar] 'error_type_user' not found; run error classification first.")
-        return
-
-    counts = df_user["error_type_user"].value_counts()
-    plot_bar(
-        counts.values,
-        counts.index.tolist(),
-        title="Your Data – Error Type Counts",
-        ylabel="Count"
-    )
-
-def plot_user_facet_correlations(df_user):
+def normalize_pass_fail(series):
     """
-    Bar chart of facet correlations (machine facet vs human facet).
-    Assumes columns:
-      machine: relevance_score, comprehensiveness_score, consistency_score, objectivity_score
-      human  : human_relevance, human_comprehensiveness, human_consistency, human_objectivity
+    Map various pass/fail string values to 1/0.
+    Assumes developer uses 'Pass' / 'Fail'.
     """
-    facet_pairs = [
-        ("relevance_score",          "human_relevance",          "Relevance"),
-        ("comprehensiveness_score",  "human_comprehensiveness",  "Comprehensiveness"),
-        ("consistency_score",        "human_consistency",        "Consistency"),
-        ("objectivity_score",        "human_objectivity",        "Objectivity"),
-    ]
+    s = series.astype(str).str.strip().str.lower()
+    mapping = {
+        "pass": 1,
+        "fail": 0,
+        "1": 1,
+        "0": 0,
+        "true": 1,
+        "false": 0,
+        "yes": 1,
+        "no": 0,
+    }
+    return s.map(mapping).astype(int)
 
-    labels = []
-    corrs = []
-    for mcol, hcol, label in facet_pairs:
-        if mcol in df_user.columns and hcol in df_user.columns:
-            sub = df_user[[mcol, hcol]].dropna()
-            if len(sub) > 1:
-                r = sub[mcol].corr(sub[hcol])
-                corrs.append(r)
-                labels.append(label)
+# Column names from their file (based on your screenshot)
+COL_LLM   = "LLM Eval (Show Answer to User)"
+COL_HUMAN = "Human Eval (Show Answer to User)"
 
-    if not labels:
-        print("[User facet corr] No valid facet pairs found.")
-        return
+df_v["llm_pass"]   = normalize_pass_fail(df_v[COL_LLM])
+df_v["human_pass"] = normalize_pass_fail(df_v[COL_HUMAN])
 
-    plot_bar(
-        corrs,
-        labels,
-        title="Your Data – Machine vs Human Facet Correlations",
-        ylabel="Correlation"
-    )
+y_true = df_v["human_pass"]
+y_llm  = df_v["llm_pass"]
 
-def plot_user_facet_means(df_user):
-    """Grouped bars: machine vs human facet means on your dataset."""
-    facet_pairs = [
-        ("relevance_score",          "human_relevance",          "Relevance"),
-        ("comprehensiveness_score",  "human_comprehensiveness",  "Comprehensiveness"),
-        ("consistency_score",        "human_consistency",        "Consistency"),
-        ("objectivity_score",        "human_objectivity",        "Objectivity"),
-    ]
+# ============================================================
+# (2) DIRECT AGREEMENT BETWEEN MODEL AND HUMAN EVALUATORS
+# ============================================================
 
-    labels = []
-    mach_means = []
-    hum_means  = []
+# Overall agreement rate
+agreement_rate = (y_true == y_llm).mean()
 
-    for mcol, hcol, label in facet_pairs:
-        if mcol in df_user.columns and hcol in df_user.columns:
-            m_mean = df_user[mcol].mean()
-            h_mean = df_user[hcol].mean()
-            mach_means.append(m_mean)
-            hum_means.append(h_mean)
-            labels.append(label)
+# Confusion matrix (rows = human, cols = GPT-4.1)
+cm = confusion_matrix(y_true, y_llm, labels=[0, 1])
 
-    if not labels:
-        print("[User facet means] No valid facet pairs found.")
-        return
+# Cohen's kappa
+kappa = cohen_kappa_score(y_true, y_llm)
 
-    plot_grouped_bar(
-        labels,
-        hum_means,
-        mach_means,
-        label_a="Human",
-        label_b="Machine",
-        title="Your Data – Facet Mean Scores (Human vs Machine)",
-        ylabel="Average score"
-    )
+print("=== Developer Dataset: Judge vs Human Agreement ===")
+print(f"Number of samples: {len(df_v)}")
+print(f"Raw agreement rate: {agreement_rate:.3f}")
+print(f"Cohen's kappa:      {kappa:.3f}\n")
 
+print("Confusion matrix (rows = Human, cols = GPT-4.1):")
+print("      GPT-4.1:  Fail   Pass")
+print("Human:")
+print(f"  Fail      {cm[0,0]:5d} {cm[0,1]:5d}")
+print(f"  Pass      {cm[1,0]:5d} {cm[1,1]:5d}\n")
 
-# =============================================================================
-# C) Benchmark plots (if model_summary from benchmark code exists)
-# =============================================================================
+print("Classification report (positive class = PASS):")
+print(classification_report(
+    y_true,
+    y_llm,
+    target_names=["Fail (0)", "Pass (1)"],
+    digits=3
+))
 
-def plot_benchmark_metric_bars(model_summary, metric="accuracy"):
-    """
-    Bar chart of a chosen metric across models.
-    Expects model_summary as a DataFrame with index=model_name and columns including metric.
-    """
-    if model_summary is None or metric not in model_summary.columns:
-        print(f"[Benchmark metric] '{metric}' not in model_summary.")
-        return
+# ============================================================
+# (3) END-TO-END PRECISION & RECALL
+#     Scenario A: without judge (everything shown)
+#     Scenario B: with GPT-4.1 judge
+# ============================================================
 
-    labels = model_summary.index.tolist()
-    vals = model_summary[metric].values
-    plot_bar(
-        vals,
-        labels,
-        title=f"Benchmark – {metric.capitalize()} by Model",
-        ylabel=metric.capitalize()
-    )
+# Scenario A: NO JUDGE — all answers are shown → predict PASS for all
+y_pred_no_judge = pd.Series(1, index=df_v.index)
 
-def plot_benchmark_facet_corr(model_summary, facet="relevance"):
-    """
-    Bar chart of facet correlations per model.
-    Expects columns like 'relevance_corr', 'comprehensiveness_corr', etc.
-    """
-    col = f"{facet}_corr"
-    if model_summary is None or col not in model_summary.columns:
-        print(f"[Benchmark facet corr] '{col}' not in model_summary.")
-        return
+prec_no = precision_score(y_true, y_pred_no_judge, zero_division=0)
+rec_no  = recall_score(y_true, y_pred_no_judge,  zero_division=0)
+f05_no  = fbeta_score(y_true, y_pred_no_judge, beta=0.5, zero_division=0)
 
-    labels = model_summary.index.tolist()
-    vals = model_summary[col].values
-    plot_bar(
-        vals,
-        labels,
-        title=f"Benchmark – {facet.capitalize()} Correlation by Model",
-        ylabel="Correlation"
-    )
+# Scenario B: WITH GPT-4.1 judge
+prec_llm = precision_score(y_true, y_llm, zero_division=0)
+rec_llm  = recall_score(y_true, y_llm,  zero_division=0)
+f05_llm  = fbeta_score(y_true, y_llm, beta=0.5, zero_division=0)
 
+print("=== End-to-End Performance (Human Eval as Ground Truth) ===")
+print("Positive class = PASS (legitimate / grounded answer)\n")
 
-# =============================================================================
-# HOW TO USE (examples)
-# =============================================================================
-# After running your analysis code and this plotting code, you can do things like:
-#
-#   plot_vendor_confusion_matrix(df_vendor)
-#   plot_vendor_error_bar(df_vendor)
-#   plot_vendor_facet_means_by_human(df_vendor)
-#
-#   plot_user_confusion_matrix(df_user)
-#   plot_user_error_bar(df_user)
-#   plot_user_facet_correlations(df_user)
-#   plot_user_facet_means(df_user)
-#
-#   # If you ran the benchmark and have model_summary:
-#   plot_benchmark_metric_bars(model_summary, metric="accuracy")
-#   plot_benchmark_metric_bars(model_summary, metric="f1")
-#   plot_benchmark_facet_corr(model_summary, facet="relevance")
-#   plot_benchmark_facet_corr(model_summary, facet="comprehensiveness")
-#
-# Uncomment plt.show() inside functions if you prefer them to auto-display.
-# Or call plt.show() yourself after a batch of plots in notebooks / scripts.
-# =============================================================================
+print("Scenario A – Without judge (all answers shown):")
+print(f"  Precision: {prec_no:.3f}")
+print(f"  Recall:    {rec_no:.3f}")
+print(f"  F0.5:      {f05_no:.3f}\n")
+
+print("Scenario B – With GPT-4.1 judge:")
+print(f"  Precision: {prec_llm:.3f}")
+print(f"  Recall:    {rec_llm:.3f}")
+print(f"  F0.5:      {f05_llm:.3f}")
