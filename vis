@@ -1,110 +1,319 @@
+import os
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
     cohen_kappa_score,
-    precision_score,
     recall_score,
-    fbeta_score,
+    f1_score,
 )
 
-# ============================================================
-# Load developer dataset
-# ============================================================
-PATH_VENDOR = "./Marque_ai/mq_ai_lite_results.csv"
-df_v = pd.read_csv(PATH_VENDOR)
+# =============================================================================
+# CONFIG – UPDATE THESE NAMES TO MATCH YOUR FILE
+# =============================================================================
 
-# ============================================================
-# Helper: normalize Pass/Fail columns to 0/1
-# ============================================================
+BASE_DIR = "./Marque_ai"
+MRM_PATH = os.path.join(BASE_DIR, "MRM_queries_final.csv")
 
-def normalize_pass_fail(series):
-    """
-    Map various pass/fail string values to 1/0.
-    Assumes developer uses 'Pass' / 'Fail'.
-    """
-    s = series.astype(str).str.strip().str.lower()
-    mapping = {
-        "pass": 1,
-        "fail": 0,
-        "1": 1,
-        "0": 0,
-        "true": 1,
-        "false": 0,
-        "yes": 1,
-        "no": 0,
-    }
-    return s.map(mapping).astype(int)
+# Human facet scores (your labels)
+# <<< EDIT if needed >>>
+HUMAN_FACET_COLS = [
+    "human_relevance",         # human relevance score
+    "human_comprehensiveness", # human comprehensiveness score
+    "human_consistency",       # human consistency score
+    "human_objectivity",       # human objectivity score
+]
 
-# Column names from their file (based on your screenshot)
-COL_LLM   = "LLM Eval (Show Answer to User)"
-COL_HUMAN = "Human Eval (Show Answer to User)"
+# GPT-4.1 judge facet scores
+# <<< EDIT if needed >>>
+GPT41_FACET_COLS = [
+    "relevance_score",         # GPT-4.1 relevance
+    "comprehensiveness_score", # GPT-4.1 comprehensiveness
+    "consistency_score",       # GPT-4.1 consistency
+    "objectivity_score",       # GPT-4.1 objectivity
+]
 
-df_v["llm_pass"]   = normalize_pass_fail(df_v[COL_LLM])
-df_v["human_pass"] = normalize_pass_fail(df_v[COL_HUMAN])
+# Gemini judge facet scores (same order, _gemini suffix)
+# <<< EDIT if needed >>>
+GEMINI_FACET_COLS = [
+    "relevance_score_gemini",
+    "comprehensiveness_score_gemini",
+    "consistency_score_gemini",
+    "objectivity_score_gemini",
+]
 
-y_true = df_v["human_pass"]
-y_llm  = df_v["llm_pass"]
+# Weights for facets in human + model weighted score
+FACET_WEIGHTS = np.array([0.4, 0.3, 0.2, 0.1])
 
-# ============================================================
-# (2) DIRECT AGREEMENT BETWEEN MODEL AND HUMAN EVALUATORS
-# ============================================================
+# Threshold for converting weighted scores into pass/fail
+PASS_THRESHOLD = 0.6
 
-# Overall agreement rate
-agreement_rate = (y_true == y_llm).mean()
+# =============================================================================
+# LOAD DATA
+# =============================================================================
 
-# Confusion matrix (rows = human, cols = GPT-4.1)
-cm = confusion_matrix(y_true, y_llm, labels=[0, 1])
+df = pd.read_csv(MRM_PATH)
 
-# Cohen's kappa
-kappa = cohen_kappa_score(y_true, y_llm)
+print("Columns in MRM file:")
+print(df.columns.tolist())
+print()
 
-print("=== Developer Dataset: Judge vs Human Agreement ===")
-print(f"Number of samples: {len(df_v)}")
-print(f"Raw agreement rate: {agreement_rate:.3f}")
-print(f"Cohen's kappa:      {kappa:.3f}\n")
+# =============================================================================
+# BUILD WEIGHTED HUMAN SCORE AND PASS/FAIL
+# =============================================================================
 
-print("Confusion matrix (rows = Human, cols = GPT-4.1):")
-print("      GPT-4.1:  Fail   Pass")
-print("Human:")
-print(f"  Fail      {cm[0,0]:5d} {cm[0,1]:5d}")
-print(f"  Pass      {cm[1,0]:5d} {cm[1,1]:5d}\n")
+def weighted_score(df, cols, weights):
+    arr = df[cols].astype(float).to_numpy()
+    return (arr * weights.reshape(1, -1)).sum(axis=1)
 
-print("Classification report (positive class = PASS):")
-print(classification_report(
-    y_true,
-    y_llm,
-    target_names=["Fail (0)", "Pass (1)"],
-    digits=3
-))
+# Human weighted overall score
+df["human_score_weighted"] = weighted_score(df, HUMAN_FACET_COLS, FACET_WEIGHTS)
+df["human_pass"] = (df["human_score_weighted"] >= PASS_THRESHOLD).astype(int)
 
-# ============================================================
-# (3) END-TO-END PRECISION & RECALL
-#     Scenario A: without judge (everything shown)
-#     Scenario B: with GPT-4.1 judge
-# ============================================================
+print("Human weighted score summary:")
+print(df["human_score_weighted"].describe())
+print("\nHuman pass distribution:")
+print(df["human_pass"].value_counts(dropna=False))
+print()
 
-# Scenario A: NO JUDGE — all answers are shown → predict PASS for all
-y_pred_no_judge = pd.Series(1, index=df_v.index)
+# =============================================================================
+# BUILD WEIGHTED SCORES + PASS/FAIL FOR GPT-4.1 & GEMINI
+# =============================================================================
 
-prec_no = precision_score(y_true, y_pred_no_judge, zero_division=0)
-rec_no  = recall_score(y_true, y_pred_no_judge,  zero_division=0)
-f05_no  = fbeta_score(y_true, y_pred_no_judge, beta=0.5, zero_division=0)
+df["gpt41_score_weighted"] = weighted_score(df, GPT41_FACET_COLS, FACET_WEIGHTS)
+df["gemini_score_weighted"] = weighted_score(df, GEMINI_FACET_COLS, FACET_WEIGHTS)
 
-# Scenario B: WITH GPT-4.1 judge
-prec_llm = precision_score(y_true, y_llm, zero_division=0)
-rec_llm  = recall_score(y_true, y_llm,  zero_division=0)
-f05_llm  = fbeta_score(y_true, y_llm, beta=0.5, zero_division=0)
+df["gpt41_pass"] = (df["gpt41_score_weighted"] >= PASS_THRESHOLD).astype(int)
+df["gemini_pass"] = (df["gemini_score_weighted"] >= PASS_THRESHOLD).astype(int)
 
-print("=== End-to-End Performance (Human Eval as Ground Truth) ===")
-print("Positive class = PASS (legitimate / grounded answer)\n")
+print("GPT-4.1 weighted score summary:")
+print(df["gpt41_score_weighted"].describe())
+print("\nGemini weighted score summary:")
+print(df["gemini_score_weighted"].describe())
+print()
 
-print("Scenario A – Without judge (all answers shown):")
-print(f"  Precision: {prec_no:.3f}")
-print(f"  Recall:    {rec_no:.3f}")
-print(f"  F0.5:      {f05_no:.3f}\n")
+# =============================================================================
+# HELPER: AGREEMENT METRICS
+# =============================================================================
+
+def print_agreement_metrics(name, y_true, y_pred):
+    print(f"=== {name}: Agreement with Human ===")
+    agreement = (y_true == y_pred).mean()
+    kappa = cohen_kappa_score(y_true, y_pred)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    print(f"Raw agreement: {agreement:.3f}")
+    print(f"Cohen's kappa: {kappa:.3f}")
+    print(f"Recall (PASS): {rec:.3f}")
+    print(f"F1 (PASS):     {f1:.3f}\n")
+
+    print("Confusion matrix (rows = Human, cols = Model):")
+    print("        Model:  Fail   Pass")
+    print("Human:")
+    print(f"  Fail      {cm[0,0]:5d} {cm[0,1]:5d}")
+    print(f"  Pass      {cm[1,0]:5d} {cm[1,1]:5d}\n")
+
+    print("Classification report:")
+    print(classification_report(
+        y_true, y_pred,
+        target_names=["Fail (0)", "Pass (1)"],
+        digits=3,
+        zero_division=0
+    ))
+    print("-" * 60 + "\n")
+
+y_true = df["human_pass"].astype(int)
+y_gpt41 = df["gpt41_pass"].astype(int)
+y_gem   = df["gemini_pass"].astype(int)
+
+print_agreement_metrics("GPT-4.1", y_true, y_gpt41)
+print_agreement_metrics("Gemini",  y_true, y_gem)
+
+# =============================================================================
+# END-TO-END METRICS: No judge vs GPT-4.1 vs Gemini
+# =============================================================================
+
+# Scenario A: no judge – everything is PASS
+y_nojudge = pd.Series(1, index=df.index)
+
+rec_no = recall_score(y_true, y_nojudge, zero_division=0)
+f1_no  = f1_score(y_true, y_nojudge, zero_division=0)
+
+rec_41 = recall_score(y_true, y_gpt41, zero_division=0)
+f1_41  = f1_score(y_true, y_gpt41, zero_division=0)
+
+rec_g  = recall_score(y_true, y_gem, zero_division=0)
+f1_g   = f1_score(y_true, y_gem, zero_division=0)
+
+print("=== End-to-End Metrics (Human = ground truth, POS = PASS) ===")
+print("Scenario A – No judge (all answers shown):")
+print(f"  Recall: {rec_no:.3f}")
+print(f"  F1:     {f1_no:.3f}\n")
 
 print("Scenario B – With GPT-4.1 judge:")
-print(f"  Precision: {prec_llm:.3f}")
-print(f"  Recall:    {rec_llm:.3f}")
-print(f"  F0.5:      {f05_llm:.3f}")
+print(f"  Recall: {rec_41:.3f}")
+print(f"  F1:     {f1_41:.3f}\n")
+
+print("Scenario C – With Gemini judge:")
+print(f"  Recall: {rec_g:.3f}")
+print(f"  F1:     {f1_g:.3f}")
+print("-" * 60 + "\n")
+
+# =============================================================================
+# FACET-LEVEL CORRELATIONS
+# =============================================================================
+
+def facet_correlations(df, human_cols, model_cols, model_name):
+    corrs = {}
+    for h_col, m_col in zip(human_cols, model_cols):
+        corrs[h_col] = df[h_col].astype(float).corr(df[m_col].astype(float))
+    corr_series = pd.Series(corrs)
+    print(f"=== Facet correlations: Human vs {model_name} ===")
+    print(corr_series)
+    print()
+    return corr_series
+
+corr_gpt41 = facet_correlations(df, HUMAN_FACET_COLS, GPT41_FACET_COLS, "GPT-4.1")
+corr_gem   = facet_correlations(df, HUMAN_FACET_COLS, GEMINI_FACET_COLS, "Gemini")
+
+corr_df = pd.DataFrame({"GPT-4.1": corr_gpt41, "Gemini": corr_gem})
+
+plt.figure(figsize=(6,4))
+sns.heatmap(corr_df, annot=True, vmin=-1, vmax=1, cmap="coolwarm")
+plt.title("Facet-level correlations with Human scores")
+plt.tight_layout()
+plt.show()
+
+# =============================================================================
+# CALIBRATION CURVES (RELIABILITY DIAGRAMS) FOR WEIGHTED SCORES
+# =============================================================================
+
+def calibration_curve(df, score_col, y_true, n_bins=5, label="Model"):
+    """Compute and plot a simple reliability diagram."""
+    data = pd.DataFrame({
+        "score": df[score_col].astype(float),
+        "y": y_true.astype(int)
+    }).dropna()
+
+    # Bin by predicted score
+    data["bin"] = pd.qcut(data["score"], q=n_bins, duplicates="drop")
+    grouped = data.groupby("bin", observed=True).agg(
+        avg_score=("score", "mean"),
+        emp_pass=("y", "mean"),
+        count=("y", "size")
+    )
+
+    print(f"\n=== Calibration summary: {label} ({score_col}) ===")
+    print(grouped)
+
+    plt.figure(figsize=(5,4))
+    plt.plot(grouped["avg_score"], grouped["emp_pass"], marker="o", label=label)
+    plt.plot([0,1], [0,1], "--", color="gray", label="Perfect calibration")
+    plt.xlabel("Average predicted score (bin)")
+    plt.ylabel("Empirical pass rate (human_pass)")
+    plt.title(f"Reliability diagram – {label}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+calibration_curve(df, "gpt41_score_weighted", df["human_pass"], n_bins=5, label="GPT-4.1")
+calibration_curve(df, "gemini_score_weighted", df["human_pass"], n_bins=5, label="Gemini")
+
+# =============================================================================
+# SCORE DISTRIBUTIONS (STRICTNESS / LENIENCY)
+# =============================================================================
+
+def plot_score_distributions(df, cols, title):
+    plt.figure(figsize=(8,4))
+    for col in cols:
+        sns.kdeplot(df[col].astype(float).dropna(), label=col, fill=False)
+    plt.title(title)
+    plt.xlabel("Score")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+plot_score_distributions(
+    df,
+    ["human_score_weighted", "gpt41_score_weighted", "gemini_score_weighted"],
+    "Weighted score distributions – Human vs GPT-4.1 vs Gemini"
+)
+
+# Facet-wise distributions (optional but nice)
+for h_col, g_col, gm_col in zip(HUMAN_FACET_COLS, GPT41_FACET_COLS, GEMINI_FACET_COLS):
+    plot_score_distributions(
+        df,
+        [h_col, g_col, gm_col],
+        f"Facet score distributions – {h_col}"
+    )
+
+# =============================================================================
+# JUDGE-VS-JUDGE AGREEMENT (GPT-4.1 vs Gemini)
+# =============================================================================
+
+y41 = df["gpt41_pass"].astype(int)
+yg  = df["gemini_pass"].astype(int)
+
+print("=== Judge vs Judge Agreement (GPT-4.1 vs Gemini) ===")
+agree_judges = (y41 == yg).mean()
+kappa_judges = cohen_kappa_score(y41, yg)
+print(f"Raw agreement: {agree_judges:.3f}")
+print(f"Cohen's kappa: {kappa_judges:.3f}\n")
+
+cm_j = confusion_matrix(y41, yg, labels=[0,1])
+print("Confusion matrix (rows = GPT-4.1, cols = Gemini):")
+print("           Gemini:  Fail   Pass")
+print("GPT-4.1:")
+print(f"   Fail      {cm_j[0,0]:5d} {cm_j[0,1]:5d}")
+print(f"   Pass      {cm_j[1,0]:5d} {cm_j[1,1]:5d}")
+print("-" * 60 + "\n")
+
+# =============================================================================
+# PAIRED SCORE COMPARISON (GPT-4.1 vs GEMINI) – SCATTER
+# =============================================================================
+
+def paired_scatter(df, col_x, col_y, title):
+    plt.figure(figsize=(5,5))
+    plt.hexbin(df[col_x], df[col_y], gridsize=15, cmap="Blues", mincnt=1)
+    plt.plot([0,1], [0,1], "--", color="red")
+    plt.xlabel(col_x)
+    plt.ylabel(col_y)
+    plt.title(title)
+    cb = plt.colorbar()
+    cb.set_label("Count")
+    plt.tight_layout()
+    plt.show()
+
+paired_scatter(df, "gpt41_score_weighted", "gemini_score_weighted",
+               "GPT-4.1 vs Gemini – Weighted scores")
+
+# Facet-level paired scatters (optional)
+for g_col, gm_col in zip(GPT41_FACET_COLS, GEMINI_FACET_COLS):
+    paired_scatter(df, g_col, gm_col, f"GPT-4.1 vs Gemini – {g_col}")
+
+# =============================================================================
+# SIMPLE ERROR TABLES – DISAGREEMENTS
+# =============================================================================
+
+disagree_gpt41 = df[df["human_pass"] != df["gpt41_pass"]]
+disagree_gem   = df[df["human_pass"] != df["gemini_pass"]]
+
+print(f"Number of GPT-4.1 disagreements with human: {len(disagree_gpt41)}")
+print(f"Number of Gemini disagreements with human:  {len(disagree_gem)}")
+
+# Save to CSV for manual review, if you like
+disagree_gpt41.to_csv(os.path.join(BASE_DIR, "disagreements_gpt41.csv"), index=False)
+disagree_gem.to_csv(os.path.join(BASE_DIR, "disagreements_gemini.csv"), index=False)
+
+print("\nDisagreement tables saved to:")
+print("  ./Marque_ai/disagreements_gpt41.csv")
+print("  ./Marque_ai/disagreements_gemini.csv")
